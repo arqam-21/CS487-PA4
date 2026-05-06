@@ -1,96 +1,96 @@
 import azure.functions as func
 import azure.durable_functions as df
-import os, json, time, requests
+import requests
+import os
+import time
+import logging
+from azure.identity import DefaultAzureCredential
+from azure.mgmt.containerinstance import ContainerInstanceManagementClient
+from azure.mgmt.containerinstance.models import (
+    ContainerGroup, Container, ResourceRequirements,
+    ResourceRequests, ImageRegistryCredential, OperatingSystemTypes,
+    ContainerGroupRestartPolicy, EnvironmentVariable
+)
 
 app = df.DFApp(http_auth_level=func.AuthLevel.FUNCTION)
 
-@app.route(route="orchestrators/my_orchestrator", methods=["POST"])
+@app.route(route="orchestrators/{functionName}")
 @app.durable_client_input(client_name="client")
-async def http_starter(req: func.HttpRequest, client: df.DurableOrchestrationClient):
-    order = req.get_json()
-    instance_id = await client.start_new("my_orchestrator", client_input=order)
+async def http_starter(req: func.HttpRequest, client):
+    function_name = req.route_params.get("functionName")
+    payload = req.get_json()
+    instance_id = await client.start_new(function_name, None, payload)
     return client.create_check_status_response(req, instance_id)
 
 @app.orchestration_trigger(context_name="context")
 def my_orchestrator(context: df.DurableOrchestrationContext):
-    # TODO: Implement the orchestrator
-    # 1. Get the input order
-    # 2. Call validate_activity with the order
-    # 3. If invalid, return {"status": "rejected", "reason": <reason>}
-    # 4. If valid, call report_activity with the order
-    # 5. Return {"status": "completed", "report_url": <report_url>}
-    pass
+    order = context.get_input()
+    validation = yield context.call_activity("validate_activity", order)
+    if not validation.get("valid"):
+        return {"status": "rejected", "reason": validation.get("reason", "unknown")}
+    report_url = yield context.call_activity("report_activity", order)
+    return {"status": "completed", "report_url": report_url}
 
 @app.activity_trigger(input_name="order")
 def validate_activity(order: dict) -> dict:
-    # TODO: Implement the validate activity
-    # 1. Get VALIDATE_URL from environment variables
-    # 2. Make a POST request to VALIDATE_URL with the order as JSON
-    # 3. Raise an exception if the request fails (r.raise_for_status())
-    # 4. Return the parsed JSON response
-    pass
+    validate_url = os.environ["VALIDATE_URL"]
+    response = requests.post(validate_url, json=order, timeout=30)
+    return response.json()
 
 @app.activity_trigger(input_name="order")
 def report_activity(order: dict) -> str:
-    from azure.mgmt.containerinstance import ContainerInstanceManagementClient
-    from azure.mgmt.containerinstance.models import (
-        ContainerGroup, Container, ResourceRequirements, ResourceRequests,
-        ImageRegistryCredential, EnvironmentVariable, OperatingSystemTypes,
-        ContainerGroupRestartPolicy, ContainerGroupIdentity, ResourceIdentityType
-    )
-    from azure.identity import DefaultAzureCredential
+    subscription_id     = os.environ["SUBSCRIPTION_ID"]
+    resource_group      = os.environ["REPORT_RG"]
+    location            = os.environ["REPORT_LOCATION"]
+    report_image        = os.environ["REPORT_IMAGE"]
+    acr_server          = os.environ["ACR_SERVER"]
+    acr_username        = os.environ["ACR_USERNAME"]
+    acr_password        = os.environ["ACR_PASSWORD"]
+    storage_account_url = os.environ["STORAGE_ACCOUNT_URL"]
+    azure_client_id     = os.environ["AZURE_CLIENT_ID"]
 
-    sub_id   = os.environ["SUBSCRIPTION_ID"]
-    rg       = os.environ["REPORT_RG"]
-    loc      = os.environ["REPORT_LOCATION"]
-    image    = os.environ["REPORT_IMAGE"]
     order_id = order["order_id"]
-    name     = f"ci-report-{order_id.lower()}"
+    container_name = f"ci-report-{order_id}".lower().replace("_", "-")
 
-    client = ContainerInstanceManagementClient(DefaultAzureCredential(), sub_id)
-    
-    # Construct the Managed Identity Resource ID
-    rollnum = rg.split("-")[-1]
-    mi_id = f"/subscriptions/{sub_id}/resourcegroups/{rg}/providers/Microsoft.ManagedIdentity/userAssignedIdentities/mi-pa4-{rollnum}"
-    
-    # TODO: Create the container group
-    # Replace the `None` values below with the correct properties.
-    # Hint: Follow the structure shown in the skeleton.
-    
-    # group = ContainerGroup(
-    #     location=loc, os_type=OperatingSystemTypes.linux,
-    #     restart_policy=ContainerGroupRestartPolicy.never,
-    #     identity=ContainerGroupIdentity(
-    #         type=ResourceIdentityType.user_assigned,
-    #         user_assigned_identities={mi_id: {}}
-    #     ),
-    #     image_registry_credentials=[ImageRegistryCredential(
-    #         server=os.environ["ACR_SERVER"],
-    #         username=os.environ["ACR_USERNAME"],
-    #         password=os.environ["ACR_PASSWORD"])],
-    #     containers=[Container(
-    #         name="report", image=image,
-    #         resources=ResourceRequirements(
-    #             requests=ResourceRequests(cpu=1.0, memory_in_gb=1.5)),
-    #         environment_variables=[
-    #             EnvironmentVariable(name="ORDER_ID", value=order_id),
-    #             EnvironmentVariable(name="ORDER_JSON", value=json.dumps(order)),
-    #             EnvironmentVariable(name="STORAGE_ACCOUNT_URL", value=os.environ["STORAGE_ACCOUNT_URL"]),
-    #             EnvironmentVariable(name="AZURE_CLIENT_ID", value=os.environ["AZURE_CLIENT_ID"]),
-    #         ])])
-    # 
-    # client.container_groups.begin_create_or_update(rg, name, group).result()
+    credential = DefaultAzureCredential(managed_identity_client_id=azure_client_id)
+    aci_client = ContainerInstanceManagementClient(credential, subscription_id)
 
-    # Poll until Succeeded (or 5 min max)
-    # for _ in range(60):
-    #     info = client.container_groups.get(rg, name)
-    #     state = info.instance_view.state if info.instance_view else None
-    #     if state in ("Succeeded", "Failed"):
-    #         break
-    #     time.sleep(5)
+    container_group = ContainerGroup(
+        location=location,
+        os_type=OperatingSystemTypes.linux,
+        restart_policy=ContainerGroupRestartPolicy.never,
+        image_registry_credentials=[
+            ImageRegistryCredential(server=acr_server, username=acr_username, password=acr_password)
+        ],
+        containers=[
+            Container(
+                name="report-job",
+                image=report_image,
+                resources=ResourceRequirements(
+                    requests=ResourceRequests(cpu=1.0, memory_in_gb=1.5)
+                ),
+                environment_variables=[
+                    EnvironmentVariable(name="ORDER_ID", value=order_id),
+                    EnvironmentVariable(name="ORDER_JSON", value=str(order)),
+                    EnvironmentVariable(name="STORAGE_ACCOUNT_URL", value=storage_account_url),
+                    EnvironmentVariable(name="AZURE_CLIENT_ID", value=azure_client_id),
+                ]
+            )
+        ]
+    )
 
-    # Clean up so it stops being a visible resource
-    # client.container_groups.begin_delete(rg, name)
+    aci_client.container_groups.begin_create_or_update(
+        resource_group, container_name, container_group
+    ).result()
 
-    # return f"{os.environ['STORAGE_ACCOUNT_URL']}/reports/{order_id}.pdf"
-    pass
+    deadline = time.time() + 300
+    while time.time() < deadline:
+        cg = aci_client.container_groups.get(resource_group, container_name)
+        state = cg.containers[0].instance_view.current_state.state if cg.containers[0].instance_view else "Unknown"
+        logging.info(f"ACI state: {state}")
+        if state == "Terminated":
+            break
+        time.sleep(10)
+
+    aci_client.container_groups.begin_delete(resource_group, container_name)
+    return f"https://pa426100095.blob.core.windows.net/reports/{order_id}.pdf"
